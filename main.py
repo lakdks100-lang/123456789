@@ -13,7 +13,7 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 DB_NAME = 'partner_bot.db'
-BACKUP_CHANNEL_ID = 1537622135173021756 # 유저님이 지정하신 백업 전용 채널 ID
+BACKUP_CHANNEL_ID = 1537622135173021756 # DB 백업용 채널 ID
 
 def init_db():
     """DB 초기화 및 테이블 생성"""
@@ -23,6 +23,7 @@ def init_db():
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
                       user_id INTEGER, 
                       webhook_url TEXT, 
+                      server_name TEXT,
                       webhook_name TEXT,
                       message TEXT, 
                       interval_hours INTEGER, 
@@ -30,7 +31,7 @@ def init_db():
         conn.commit()
 
 async def backup_db(bot_instance):
-    """지정된 백업 채널로 DB 파일을 다운로드 형태로 무한 유지 백업"""
+    """지정된 백업 채널로 DB 파일을 무한 유지 백업"""
     channel = bot_instance.get_channel(BACKUP_CHANNEL_ID)
     if channel:
         try:
@@ -45,25 +46,24 @@ async def backup_db(bot_instance):
         except Exception as e:
             print(f"[백업 실패] 채널 전송 중 오류 발생: {e}")
 
-class IntervalView(discord.ui.View):
-    """메시지 주기 설정을 위한 1h, 12h, 24h 버튼 임베드 UI"""
-    def __init__(self, user_id: int, webhook_url: str):
+class UnifiedIntervalView(discord.ui.View):
+    """유저 단위 메시지 주기 설정을 위한 버튼 임베드 UI"""
+    def __init__(self, user_id: int):
         super().__init__(timeout=120)
         self.user_id = user_id
-        self.webhook_url = webhook_url
 
     async def update_interval(self, interaction: discord.Interaction, hours: int):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ 본인이 등록한 웹훅의 주기만 설정할 수 있습니다.", ephemeral=True)
+            await interaction.response.send_message("❌ 본인의 설정만 변경할 수 있습니다.", ephemeral=True)
             return
             
+        # 해당 유저의 '모든' 웹훅 주기를 일괄 업데이트
         with sqlite3.connect(DB_NAME) as conn:
             c = conn.cursor()
-            c.execute("UPDATE webhooks SET interval_hours = ? WHERE webhook_url = ? AND user_id = ?", 
-                      (hours, self.webhook_url, self.user_id))
+            c.execute("UPDATE webhooks SET interval_hours = ? WHERE user_id = ?", (hours, self.user_id))
             conn.commit()
             
-        await interaction.response.send_message(f"✅ 설정 완료! 이제 이 웹훅은 **{hours}시간** 단위로 메시지를 발송합니다.", ephemeral=True)
+        await interaction.response.send_message(f"✅ **설정 완료!** 계정에 등록된 모든 웹훅의 발송 주기가 **{hours}시간**으로 통합 적용되었습니다.", ephemeral=True)
 
     @discord.ui.button(label="1시간 (1h)", style=discord.ButtonStyle.primary, custom_id="btn_1h")
     async def btn_1(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -101,104 +101,146 @@ async def set_webhook(interaction: discord.Interaction, 웹훅_url: str):
 
     user_id = interaction.user.id
     current_time = time.time()
+    
+    server_name = "알 수 없는 서버"
     webhook_name = "알 수 없는 채널"
 
-    # 웹훅 정보(채널 이름 등)를 디스코드 API에서 읽어와서 저장
+    # 웹훅 정보에서 채널명 및 서버(길드) 식별
     try:
         async with aiohttp.ClientSession() as session:
             webhook = discord.Webhook.from_url(웹훅_url, session=session)
             fetched_webhook = await webhook.fetch()
             if fetched_webhook.name:
                 webhook_name = fetched_webhook.name
+            # 봇이 해당 서버에 있다면 서버 이름도 가져옴
+            if fetched_webhook.guild_id:
+                guild = bot.get_guild(fetched_webhook.guild_id)
+                if guild:
+                    server_name = guild.name
     except Exception:
-        pass # 읽어오기 실패해도 등록은 진행
+        pass 
     
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        # 이미 존재하는 웹훅인지 확인
         c.execute("SELECT id FROM webhooks WHERE webhook_url = ? AND user_id = ?", (웹훅_url, user_id))
         if c.fetchone():
             await interaction.response.send_message("⚠️ **이미 등록된 웹훅입니다.**", ephemeral=True)
             return
 
-        c.execute("INSERT INTO webhooks (user_id, webhook_url, webhook_name, message, interval_hours, last_sent) VALUES (?, ?, ?, ?, ?, ?)", 
-                  (user_id, 웹훅_url, webhook_name, "메시지가 설정되지 않았습니다.", 0, current_time))
+        # 해당 유저가 기존에 등록한 설정(메시지, 주기)이 있는지 확인하여 통일(상속)시킴
+        c.execute("SELECT message, interval_hours FROM webhooks WHERE user_id = ? LIMIT 1", (user_id,))
+        existing_setting = c.fetchone()
+        
+        if existing_setting:
+            shared_message, shared_interval = existing_setting
+        else:
+            shared_message, shared_interval = "메시지가 설정되지 않았습니다.", 0
+
+        c.execute("INSERT INTO webhooks (user_id, webhook_url, server_name, webhook_name, message, interval_hours, last_sent) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                  (user_id, 웹훅_url, server_name, webhook_name, shared_message, shared_interval, current_time))
         conn.commit()
     
-    await interaction.response.send_message(f"✅ **웹훅이 등록되었습니다.** (인식된 이름: `{webhook_name}`)\n`/메시지설정` 명령어로 내용을 작성해주세요.", ephemeral=True)
+    await interaction.response.send_message(f"✅ **웹훅이 추가되었습니다.**\n- 서버: `{server_name}`\n- 채널: `{webhook_name}`\n*(기존에 설정하신 메시지와 발송 주기가 이 웹훅에도 똑같이 적용됩니다.)*", ephemeral=True)
     await backup_db(bot)
 
-@bot.tree.command(name="메시지설정", description="등록된 웹훅에 발송할 메시지 내용을 설정합니다.")
+@bot.tree.command(name="웹훅메시지설정", description="내 계정에 등록된 모든 웹훅의 발송 메시지를 하나로 통합 설정합니다.")
 @app_commands.default_permissions(administrator=True)
-async def set_message(interaction: discord.Interaction, 웹훅_url: str, 메시지: str):
+async def set_unified_message(interaction: discord.Interaction, 메시지: str):
     user_id = interaction.user.id
     
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        c.execute("SELECT id FROM webhooks WHERE webhook_url = ? AND user_id = ?", (웹훅_url, user_id))
+        c.execute("SELECT id FROM webhooks WHERE user_id = ?", (user_id,))
         if not c.fetchone():
-            await interaction.response.send_message("❌ **DB에서 해당 웹훅을 찾을 수 없습니다.** 먼저 `/웹훅설정`을 해주세요.", ephemeral=True)
+            await interaction.response.send_message("❌ **등록된 웹훅이 없습니다.** `/웹훅설정`으로 먼저 웹훅을 추가해주세요.", ephemeral=True)
             return
             
-        c.execute("UPDATE webhooks SET message = ? WHERE webhook_url = ? AND user_id = ?", (메시지, 웹훅_url, user_id))
+        # 해당 유저의 모든 웹훅 메시지를 일괄 업데이트
+        c.execute("UPDATE webhooks SET message = ? WHERE user_id = ?", (메시지, user_id))
         conn.commit()
         
-    await interaction.response.send_message("✅ **해당 웹훅의 메시지가 성공적으로 저장되었습니다.**", ephemeral=True)
+    await interaction.response.send_message("✅ **메시지 설정 완료!**\n계정에 연동된 모든 웹훅에서 해당 메시지가 발송되도록 통합 적용되었습니다.", ephemeral=True)
 
-@bot.tree.command(name="웹훅주기", description="임베드 버튼을 통해 웹훅의 자동 발송 주기를 설정합니다.")
+@bot.tree.command(name="웹훅주기", description="내 계정에 등록된 모든 웹훅의 자동 발송 주기를 버튼으로 일괄 설정합니다.")
 @app_commands.default_permissions(administrator=True)
-async def set_interval(interaction: discord.Interaction, 웹훅_url: str):
+async def set_unified_interval(interaction: discord.Interaction):
     user_id = interaction.user.id
     
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        c.execute("SELECT webhook_name FROM webhooks WHERE webhook_url = ? AND user_id = ?", (웹훅_url, user_id))
-        result = c.fetchone()
-    
-    if not result:
-        await interaction.response.send_message("❌ **해당 웹훅을 찾을 수 없습니다.**", ephemeral=True)
-        return
+        c.execute("SELECT id FROM webhooks WHERE user_id = ?", (user_id,))
+        if not c.fetchone():
+            await interaction.response.send_message("❌ **등록된 웹훅이 없습니다.** `/웹훅설정`으로 먼저 웹훅을 추가해주세요.", ephemeral=True)
+            return
         
-    webhook_name = result[0]
-    
-    embed = discord.Embed(title="⏱️ 웹훅 발송 주기 설정", description=f"**대상 채널/웹훅:** `{webhook_name}`\n\n아래 버튼을 눌러 이 웹훅에 메시지를 보낼 시간 단위를 선택해주세요.", color=0x3498db)
-    view = IntervalView(user_id, 웹훅_url)
+    embed = discord.Embed(
+        title="⏱️ 전체 웹훅 발송 주기 설정", 
+        description="아래 버튼을 누르시면, 유저님이 등록하신 **모든 웹훅**에 메시지를 보낼 주기가 통합 변경됩니다.", 
+        color=0x3498db
+    )
+    view = UnifiedIntervalView(user_id)
     
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-@bot.tree.command(name="웹훅확인", description="현재 연동된 웹훅 개수와 상세 정보를 확인합니다.")
+@bot.tree.command(name="웹훅확인", description="현재 연동된 서버, 채널, 고유 ID 등 웹훅 상세 정보를 확인합니다.")
 @app_commands.default_permissions(administrator=True)
 async def check_webhooks(interaction: discord.Interaction):
     user_id = interaction.user.id
     
     with sqlite3.connect(DB_NAME) as conn:
         c = conn.cursor()
-        c.execute("SELECT webhook_name, interval_hours, message FROM webhooks WHERE user_id = ?", (user_id,))
+        # id(고유 ID), 서버명, 채널명, 주기, 메시지 순으로 가져옴
+        c.execute("SELECT id, server_name, webhook_name, interval_hours, message FROM webhooks WHERE user_id = ?", (user_id,))
         rows = c.fetchall()
         
     total_count = len(rows)
     
-    embed = discord.Embed(title="📊 내 파트너 웹훅 연동 현황", description=f"현재 총 **{total_count}개**의 웹훅이 연동되어 있습니다.", color=0x2ecc71)
-    
     if total_count == 0:
-        embed.add_field(name="목록 없음", value="연동된 웹훅이 없습니다. `/웹훅설정`을 통해 추가해주세요.", inline=False)
-    else:
-        # 디스코드 임베드 필드 제한(최대 25개) 방지를 위해 10개까지만 상세 표시
-        for i, row in enumerate(rows[:10]):
-            name, interval, msg = row
-            status = f"{interval}시간마다 발송" if interval > 0 else "주기 미설정 (발송 정지)"
-            preview_msg = msg[:30] + "..." if len(msg) > 30 else msg
-            
-            embed.add_field(
-                name=f"{i+1}. {name}", 
-                value=f"⏱️ **상태:** {status}\n📝 **메시지:** {preview_msg}", 
-                inline=False
-            )
-            
-        if total_count > 10:
-            embed.set_footer(text=f"이외에 {total_count - 10}개의 웹훅이 더 있습니다.")
+        await interaction.response.send_message("❌ 연동된 웹훅이 없습니다. `/웹훅설정`을 통해 추가해주세요.", ephemeral=True)
+        return
+
+    # 공통 설정값 추출 (어차피 동일함)
+    common_interval = rows[0][3]
+    common_msg = rows[0][4]
+    status = f"**{common_interval}시간**마다 발송" if common_interval > 0 else "주기 미설정 (발송 정지)"
+    preview_msg = common_msg[:40] + "..." if len(common_msg) > 40 else common_msg
+
+    embed = discord.Embed(title="📊 내 파트너 웹훅 연동 현황", color=0x2ecc71)
+    embed.description = f"**[공통 설정]**\n⏱️ **주기:** {status}\n📝 **메시지:** {preview_msg}\n\n**[등록된 웹훅 목록 - 총 {total_count}개]**"
+    
+    # 25개 임베드 필드 제한 방지
+    for row in rows[:15]:
+        hook_id, s_name, w_name, _, _ = row
+        embed.add_field(
+            name=f"🔑 고유 ID: {hook_id}", 
+            value=f"🏢 **서버:** {s_name}\n💬 **채널:** {w_name}", 
+            inline=False
+        )
+        
+    if total_count > 15:
+        embed.set_footer(text=f"이외에 {total_count - 15}개의 웹훅이 더 있습니다. 삭제 시 고유 ID를 이용해주세요.")
             
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="웹훅삭제", description="고유 ID를 입력하여 특정 웹훅만 삭제합니다.")
+@app_commands.default_permissions(administrator=True)
+async def delete_webhook(interaction: discord.Interaction, 고유_id: int):
+    user_id = interaction.user.id
+    
+    with sqlite3.connect(DB_NAME) as conn:
+        c = conn.cursor()
+        c.execute("SELECT server_name, webhook_name FROM webhooks WHERE id = ? AND user_id = ?", (고유_id, user_id))
+        target = c.fetchone()
+        
+        if not target:
+            await interaction.response.send_message(f"❌ **고유 ID {고유_id}번** 웹훅을 찾을 수 없거나 삭제 권한이 없습니다.", ephemeral=True)
+            return
+            
+        s_name, w_name = target
+        c.execute("DELETE FROM webhooks WHERE id = ?", (고유_id,))
+        conn.commit()
+        
+    await interaction.response.send_message(f"🗑️ **삭제 완료:** 고유 ID **{고유_id}**번 웹훅이 제거되었습니다.\n(서버: `{s_name}` / 채널: `{w_name}`)", ephemeral=True)
 
 # ----------------- 백그라운드 발송 및 웹 서버 -----------------
 
