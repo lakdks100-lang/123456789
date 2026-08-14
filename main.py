@@ -6,6 +6,7 @@ import time
 import aiohttp
 import os
 import re
+from aiohttp import web
 
 # 봇 기본 설정
 intents = discord.Intents.default()
@@ -168,10 +169,40 @@ async def webhook_sender_loop():
                 except Exception as e:
                     print(f"[전송 실패] 웹훅 ID: {db_id} / 에러: {e}")
 
-# Render 환경 변수(Environment Variables)에서 토큰을 가져와 실행합니다.
+# --- Render 포트 바인딩을 위한 웹 서버 설정 ---
+async def handle_health_check(request):
+    """Render가 앱이 살아있는지 확인(Health Check)할 수 있도록 응답을 반환합니다."""
+    return web.Response(text="Discord Bot is running and port is open!")
+
+async def start_web_server():
+    """aiohttp를 사용하여 비동기 웹 서버를 시작합니다."""
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Render 환경 변수 PORT를 가져오며, 없을 경우 기본값 10000 사용
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 렌더 포트 바인딩 완료: 포트 {port}번에서 웹 서버 가동 중")
+
+# --- 메인 실행 블록 ---
 if __name__ == "__main__":
     TOKEN = os.getenv("BOT_TOKEN")
     if not TOKEN:
         print("❌ [오류] 환경 변수에 'BOT_TOKEN'이 설정되지 않았습니다.")
     else:
-        bot.run(TOKEN)
+        import asyncio
+        
+        async def main():
+            # 디스코드 기본 로깅 설정
+            discord.utils.setup_logging()
+            
+            # 웹 서버와 디스코드 봇을 동시에 비동기로 실행
+            await start_web_server()
+            async with bot:
+                await bot.start(TOKEN)
+
+        # 비동기 이벤트 루프 실행
+        asyncio.run(main())
